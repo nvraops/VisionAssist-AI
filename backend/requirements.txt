@@ -72,3 +72,4 @@ urllib3==2.7.0
 uvicorn==0.48.0
 zope.event==6.2
 zope.interface==8.5
+app = FastAPI()
