@@ -28,6 +28,35 @@ const getRelativeDirection = (clockStr: string) => {
   return "ahead";
 };
 
+const getObjectIcon = (name: string) => {
+  const n = (name || "").toLowerCase();
+  if (n.includes('person') || n.includes('human')) return '🚶';
+  if (n.includes('boat')) return '🚤';
+  if (n.includes('building')) return '🏢';
+  if (n.includes('car')) return '🚗';
+  if (n.includes('bus')) return '🚌';
+  if (n.includes('truck')) return '🚚';
+  if (n.includes('motorcycle') || n.includes('bike')) return '🏍️';
+  if (n.includes('bicycle')) return '🚲';
+  if (n.includes('stairs')) return '🪜';
+  if (n.includes('pothole')) return '⚠️';
+  if (n.includes('chair') || n.includes('bench')) return '🪑';
+  if (n.includes('door')) return '🚪';
+  if (n.includes('bottle') || n.includes('cup')) return '🥤';
+  if (n.includes('dog') || n.includes('cat')) return '🐾';
+  return '🎯';
+};
+
+interface LiveCaption {
+  id: string;
+  time: string;
+  objectName: string;
+  direction: string;
+  distance: string;
+  confidence: number;
+  icon: string;
+}
+
 const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, facingMode, setFacingMode }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [subtitles, setSubtitles] = useState("");
@@ -95,6 +124,17 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
   const subtitleTimeoutRef = useRef<any>(null);
   const lastDetectedObjectsRef = useRef<string[]>([]);
   const lastAnnouncedStateRef = useRef<{ [key: string]: { time: number; distance: number; clock: string } }>({});
+
+  // YouTube Live style comments & Speech Queue State
+  const isSpeakingRef = useRef<boolean>(false);
+  const speechQueueRef = useRef<string[]>([]);
+  const lastSpokenDialogueRef = useRef<string>("");
+  const dialogueTimestampsRef = useRef<{ [dialogue: string]: number }>({});
+  const [liveCaptions, setLiveCaptions] = useState<LiveCaption[]>([]);
+
+  // Live Object Count Breakdown State (e.g. Human: 3, Car: 2, Boat: 1)
+  const [objectCounts, setObjectCounts] = useState<{ [key: string]: number }>({});
+  const [totalDetectionsCount, setTotalDetectionsCount] = useState<number>(0);
 
   // Auto-unlock speech synthesis on first user click to bypass browser autoplay policies
   useEffect(() => {
@@ -173,19 +213,70 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
     return () => clearInterval(clockTimer);
   }, []);
 
-  const speakWithSubtitles = useCallback((text: string) => {
+  const speakWithSubtitles = useCallback((text: string, isSequential: boolean = false) => {
     if (subtitleTimeoutRef.current) {
       clearTimeout(subtitleTimeoutRef.current);
     }
-    setSubtitles(text);
+
+    const cleanRaw = text.replace(/^Next detection:\s*/i, '').trim().toLowerCase();
+    const now = Date.now();
+    const lastSpokenTime = dialogueTimestampsRef.current[cleanRaw] || 0;
+
+    // Guard: Do not repeat the same dialogue within 10 seconds (10,000ms)!
+    if (cleanRaw && now - lastSpokenTime < 10000) {
+      return;
+    }
+    
+    const formattedText = isSequential && !text.toLowerCase().startsWith('next detection') ? `Next detection: ${text}` : text;
+    setSubtitles(formattedText);
+    lastSpokenDialogueRef.current = cleanRaw;
+    dialogueTimestampsRef.current[cleanRaw] = now;
     
     try {
       if ('speechSynthesis' in window) {
+        if (!isSequential && isSpeakingRef.current) {
+          // Queue next announcement if it hasn't been spoken in the last 10 seconds
+          if (now - lastSpokenTime >= 10000 && !speechQueueRef.current.includes(text)) {
+            speechQueueRef.current.push(text);
+            if (speechQueueRef.current.length > 3) speechQueueRef.current.shift();
+          }
+          return;
+        }
+
         window.speechSynthesis.cancel(); // Unblock any frozen speech engine queues
-        const utterance = new SpeechSynthesisUtterance(text);
+        const utterance = new SpeechSynthesisUtterance(formattedText);
+        isSpeakingRef.current = true;
+
+        utterance.onend = () => {
+          isSpeakingRef.current = false;
+          // Trigger next queued detection that was NOT spoken in the last 10 seconds
+          if (speechQueueRef.current.length > 0) {
+            const queueNow = Date.now();
+            let nextIndex = speechQueueRef.current.findIndex(msg => {
+              const cleanMsg = msg.replace(/^Next detection:\s*/i, '').trim().toLowerCase();
+              const lastTime = dialogueTimestampsRef.current[cleanMsg] || 0;
+              return queueNow - lastTime >= 10000;
+            });
+
+            if (nextIndex !== -1) {
+              const [nextItem] = speechQueueRef.current.splice(nextIndex, 1);
+              setTimeout(() => {
+                speakWithSubtitles(nextItem, true);
+              }, 400);
+            } else {
+              speechQueueRef.current = []; // Clear queue if remaining items were spoken within 10s
+            }
+          }
+        };
+
+        utterance.onerror = () => {
+          isSpeakingRef.current = false;
+        };
+
         window.speechSynthesis.speak(utterance);
       }
     } catch (e) {
+      isSpeakingRef.current = false;
       console.error("Speech synthesis error", e);
     }
     
@@ -281,7 +372,13 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
     // Draw frame or image down-sampled to 640x480
     offscreenCtx.drawImage(sourceEl, 0, 0, 640, 480);
 
-    // Convert offscreen canvas to a lightweight JPEG blob with 70% quality
+    // NOTE: Pixel-diff frame skip REMOVED — it was preventing detection of
+    // static objects (boats, buildings, parked vehicles) when the scene didn't
+    // change enough between frames. Every frame is now sent to the backend.
+
+    // Convert offscreen canvas to JPEG blob with 80% quality
+    // (higher than previous 70% — reduces compression artifacts on moving edges
+    //  which can cause false-positive detections near object boundaries)
     offscreenCanvas.toBlob(async (blob) => {
       if (!blob) return releaseLock();
       const formData = new FormData();
@@ -290,7 +387,9 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
       try {
         setIsAnalyzing(true);
         const backendUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-        const res = await axios.post(`${backendUrl}/analyze-frame`, formData);
+        // Use the fast vision-only endpoint for continuous detection loop
+        // (skips OCR & gesture for ~2-4× lower latency)
+        const res = await axios.post(`${backendUrl}/analyze-frame-fast`, formData);
         const vision = res.data.vision;
         const gestures = res.data.gestures?.gestures || [];
         const ocrText = res.data.ocr?.text || "";
@@ -399,13 +498,14 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
         }
 
         // --- COMPOSE SILENT SUBTITLE NARRATION & DISTANCE CALCULATION ---
-        // Tiered thresholding: Lower threshold to 0.25 for critical safety hazards to enable early detection,
-        // while preserving 0.35 threshold for standard items to maintain high precision.
-        const CRITICAL_SAFETY_NAMES = new Set(['person', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle', 'stairs', 'pothole']);
+        // Permissive thresholding: 0.18 for critical safety objects (early detection),
+        // 0.20 for all others. Boat and building added to critical set so they are
+        // never filtered out even at low confidence (distant objects score low).
+        const CRITICAL_SAFETY_NAMES = new Set(['person', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle', 'stairs', 'pothole', 'boat', 'building', 'traffic light', 'stop sign', 'fire hydrant']);
         const rawDetections = (vision.detections || []).filter((d: any) => {
           const name = d.object_name.toLowerCase();
           const isCritical = CRITICAL_SAFETY_NAMES.has(name);
-          const threshold = isCritical ? 0.25 : 0.35;
+          const threshold = isCritical ? 0.18 : 0.20;
           return d.confidence >= threshold;
         });
 
@@ -485,13 +585,12 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
           const name = d.object_name.toLowerCase();
           const [mx1, my1, mx2, my2] = d.bbox;
           
-          const mHeightRatio = (my2 - my1) / 480;
-          let mDist = 1.5;
-          if (mHeightRatio > 0) {
-            mDist = parseFloat((1.2 / mHeightRatio).toFixed(1));
-          }
-          if (mDist < 0.5) mDist = 0.5;
-          if (mDist > 10.0) mDist = 10.0;
+          // Use backend-computed class-specific distance (more accurate than height-ratio alone)
+          const mDist = typeof d.distance_m === 'number' ? d.distance_m : (() => {
+            const mHeightRatio = (my2 - my1) / 480;
+            if (mHeightRatio <= 0) return 1.5;
+            return Math.min(10.0, Math.max(0.5, parseFloat((1.2 / mHeightRatio).toFixed(1))));
+          })();
 
           const mClock = d.clock_position || "12 o'clock";
           const lastAnnounced = lastAnnouncedStateRef.current[name];
@@ -504,8 +603,12 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
             const distDiff = Math.abs(mDist - lastAnnounced.distance);
             const clockChanged = mClock !== lastAnnounced.clock;
             
-            // Re-announce if it's been 10 seconds, distance changed by >= 0.5m, or direction changed
-            if (timeDiff > 10000 || distDiff >= 0.5 || clockChanged) {
+            // Re-announce thresholds:
+            // Critical objects (car, truck, etc.) — every 5s or when distance/direction changes
+            // All others — every 10s or when distance/direction changes
+            const CRITICAL_NAMES = new Set(['car', 'truck', 'bus', 'train', 'motorcycle', 'person']);
+            const reAnnounceMs = CRITICAL_NAMES.has(name) ? 5000 : 10000;
+            if (timeDiff > reAnnounceMs || distDiff >= 0.5 || clockChanged) {
               triggerSpeech = true;
             }
           }
@@ -513,9 +616,20 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
           if (triggerSpeech) {
             const announceName = name === 'person' ? 'human' : name;
             const direction = getRelativeDirection(mClock);
-            speechMsg = `${announceName} detected ${direction}, ${mDist} meters ahead.`;
+            const candidateMsg = `${announceName} ${direction}`;
+            const cleanCandidate = candidateMsg.toLowerCase().trim();
+
+            // Strict 10-Second Non-Repetition Condition:
+            // Do not say the same dialogue within the next 10 seconds!
+            // If candidate was spoken in the last 10s (10,000ms), skip it and pick SOME OTHER detected object!
+            const lastSpokenTime = dialogueTimestampsRef.current[cleanCandidate] || 0;
+            if (now - lastSpokenTime < 10000) {
+              continue; // Check next object in validDetections!
+            }
+
+            speechMsg = candidateMsg;
             lastAnnouncedStateRef.current[name] = { time: now, distance: mDist, clock: mClock };
-            break; // Announce one key object change per cycle
+            break; // Found a valid non-repeated object to announce!
           }
         }
         
@@ -530,14 +644,12 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
           const mainObject = validDetections[0];
           const [x1, y1, x2, y2] = mainObject.bbox;
           
-          // Precise distance logic based on bounding box height relative to 480px frame
-          const heightRatio = (y2 - y1) / 480;
-          let dist = 1.5;
-          if (heightRatio > 0) {
-            dist = parseFloat((1.2 / heightRatio).toFixed(1));
-          }
-          if (dist < 0.5) dist = 0.5;
-          if (dist > 10.0) dist = 10.0;
+          // Use backend-provided class-specific distance, fall back to height-ratio if missing
+          const dist = typeof mainObject.distance_m === 'number' ? mainObject.distance_m : (() => {
+            const heightRatio = (y2 - y1) / 480;
+            if (heightRatio <= 0) return 1.5;
+            return Math.min(10.0, Math.max(0.5, parseFloat((1.2 / heightRatio).toFixed(1))));
+          })();
           
           const rawName = mainObject.object_name.toLowerCase();
           const displayName = rawName === 'person' ? 'human' : rawName;
@@ -557,9 +669,9 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
           }
           prevObjectHeightRef.current = currentHeight;
           
-          // Rich, highly descriptive Accessibility Announcement format
+          // Simple, direct accessibility announcement: "human ahead", "boat on your left"
           const direction = getRelativeDirection(clockPosition);
-          speechOutput = `${primaryObjectText} detected ${direction}, ${dist} meters away. ${movement.toLowerCase()}. ${dist >= 1.5 ? "Safe distance maintained." : "Caution."}`;
+          speechOutput = `${primaryObjectText} ${direction}`;
         } else {
           speechOutput = "CLEAR PATH";
           prevObjectHeightRef.current = 0;
@@ -583,7 +695,17 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
           movement: movement
         });
 
-        // Update timeline & session metrics dynamically
+        // Calculate live object counts breakdown for ALL detected objects in frame
+        const counts: { [key: string]: number } = {};
+        validDetections.forEach((d: any) => {
+          const rawName = d.object_name.toLowerCase();
+          const displayName = rawName === 'person' ? 'human' : rawName;
+          counts[displayName] = (counts[displayName] || 0) + 1;
+        });
+        setObjectCounts(counts);
+        setTotalDetectionsCount(validDetections.length);
+
+        // Update timeline & session metrics dynamically + YouTube Live Feed Comments
         if (validDetections.length > 0) {
           const nowStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
           const itemsText = validDetections.map((d: any) => d.object_name.toUpperCase()).join(", ");
@@ -591,6 +713,33 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
             { time: nowStr, text: `${itemsText} detected at ${clockPosition}` },
             ...prev.slice(0, 15)
           ]);
+
+          // Push into YouTube Live Comments styled Feed
+          const liveItems: LiveCaption[] = validDetections.slice(0, 3).map((d: any, idx: number) => {
+            const rawName = d.object_name.toLowerCase();
+            const displayName = rawName === 'person' ? 'human' : rawName;
+            const clock = d.clock_position || "12 o'clock";
+            const dir = getRelativeDirection(clock);
+            const dist = typeof d.distance_m === 'number' ? `${d.distance_m}m` : "--";
+            return {
+              id: `${nowStr}-${idx}-${displayName}`,
+              time: nowStr,
+              objectName: displayName.toUpperCase(),
+              direction: dir,
+              distance: dist,
+              confidence: Math.round((d.confidence || 0.8) * 100),
+              icon: getObjectIcon(displayName)
+            };
+          });
+
+          setLiveCaptions(prev => {
+            const combined = [...liveItems, ...prev];
+            // Deduplicate by objectName + direction
+            const unique = combined.filter((item, index, self) =>
+              index === self.findIndex(t => t.objectName === item.objectName && t.direction === item.direction)
+            );
+            return unique.slice(0, 5); // Keep top 5 live comment cards
+          });
         }
 
         // Parse environment stats if available
@@ -624,7 +773,7 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
         setIsAnalyzing(false);
         isAnalyzingRef.current = false;
       }
-    }, 'image/jpeg', 0.7);
+    }, 'image/jpeg', 0.80);
   }, []);
 
   const handleCommand = useCallback((cmd: string) => {
@@ -744,6 +893,13 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
     } else if (cleaned.includes("back camera") || cleaned.includes("rear camera")) {
       setFacingMode('environment');
       speakWithSubtitles("Switching to back camera.");
+    } else if (cleaned.includes("how many") || cleaned.includes("count objects") || cleaned.includes("object count") || cleaned.includes("total objects") || cleaned.includes("count")) {
+      if (totalDetectionsCount === 0) {
+        speakWithSubtitles("No objects currently detected ahead.");
+      } else {
+        const summaryParts = Object.entries(objectCounts).map(([name, count]) => `${count} ${name}${count > 1 ? 's' : ''}`);
+        speakWithSubtitles(`Detected ${totalDetectionsCount} total objects: ${summaryParts.join(', ')}.`);
+      }
     } else if (cleaned.includes("hello") || cleaned.includes("hi") || cleaned.includes("hey")) {
       speakWithSubtitles("Hello! I am your vision assist companion. Tell me how I can help you.");
     } else if (cleaned.includes("who are you") || cleaned.includes("your name")) {
@@ -766,11 +922,14 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
     };
   }, []);
 
-  // Continuous Analysis loop - 1000ms for early, real-time object detection
+  // Continuous Analysis loop — 250ms gives ~4 FPS detection rate.
+  // The concurrency lock (isAnalyzingRef) ensures only one request is in-flight
+  // at a time. Combined with the fast vision-only endpoint, this gives
+  // near real-time detection with minimal delay.
   useEffect(() => {
     const interval = setInterval(() => {
       captureAndAnalyze();
-    }, 1000);
+    }, 250);
     
     return () => clearInterval(interval);
   }, [captureAndAnalyze]);
@@ -845,131 +1004,60 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
         `}</style>
 
         {/* Sleek Minimalist Floating Top HUD Toolbar */}
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', width: '100%', gap: '16px', borderBottom: 'none', paddingBottom: '0px' }}>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', gap: '12px', borderBottom: 'none', paddingBottom: '0px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
             <h2 style={{ margin: 0, fontSize: '18px', fontWeight: 800, letterSpacing: '1.2px', color: 'white', whiteSpace: 'nowrap' }}>
               <span style={{ color: '#00f2fe' }}>VISION</span>ASSIST AI
             </h2>
-            
-            {/* 🛰️ HUD TELEMETRY below VISIONASSIST AI */}
-            <div className="glass-panel" style={{
-              display: 'flex',
-              flexDirection: 'column',
-              gap: '4px',
-              padding: '10px 14px',
-              borderRadius: '16px',
-              background: 'rgba(0, 0, 0, 0.45)',
-              border: '1px solid rgba(255, 255, 255, 0.1)',
-              boxShadow: '0 4px 20px rgba(0,0,0,0.3)',
-              minWidth: '240px',
-              textAlign: 'left'
-            }}>
-              <div style={{ fontSize: '9px', fontWeight: 800, color: '#a29bfe', letterSpacing: '1.5px', textTransform: 'uppercase', borderBottom: '1px solid rgba(255,255,255,0.06)', paddingBottom: '3px', marginBottom: '3px' }}>
-                🛰️ HUD TELEMETRY
-              </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '12px', color: 'white', fontWeight: 700 }}>
-                <span>🕒</span> {timeStr || "05:14:05 PM"}
-              </div>
-              <div style={{ fontSize: '11px', color: '#00f2fe', fontWeight: 600 }}>
-                {gps.city}
-              </div>
-              <div style={{ fontSize: '10px', color: 'rgba(255,255,255,0.5)', display: 'flex', alignItems: 'center', gap: '4px', borderTop: '1px solid rgba(255,255,255,0.04)', paddingTop: '3px', marginTop: '2px' }}>
-                <span>🌐</span> GPS: <strong style={{ color: 'white' }}>{gps.lat.toFixed(4)}° N, {gps.lon.toFixed(4)}° E</strong>
-              </div>
-
-              {/* Real-time AI Target Lock Telemetry */}
-              <div style={{
-                marginTop: '6px',
-                paddingTop: '6px',
-                borderTop: '1px solid rgba(255,255,255,0.1)',
-                display: 'flex',
-                flexDirection: 'column',
-                gap: '4px'
-              }}>
-                <div style={{ fontSize: '8px', fontWeight: 800, color: '#a29bfe', letterSpacing: '1px', textTransform: 'uppercase' }}>
-                  🎯 AI TARGET LOCK
-                </div>
-                
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '11px' }}>
-                  <span style={{ color: 'rgba(255,255,255,0.5)', fontWeight: 600 }}>Object:</span>
-                  <span style={{ 
-                    color: detectionHUD.object === 'SCANNING' ? 'rgba(255,255,255,0.6)' : '#00f2fe', 
-                    fontWeight: 800,
-                    textTransform: 'uppercase',
-                    animation: detectionHUD.object === 'SCANNING' ? 'pulse-gentle 2s infinite' : 'none'
-                  }}>
-                    {detectionHUD.object}
-                  </span>
-                </div>
-
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '11px' }}>
-                  <span style={{ color: 'rgba(255,255,255,0.5)', fontWeight: 600 }}>Distance:</span>
-                  <span style={{ color: '#34c759', fontWeight: 800 }}>
-                    {detectionHUD.distance}
-                  </span>
-                </div>
-
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '11px' }}>
-                  <span style={{ color: 'rgba(255,255,255,0.5)', fontWeight: 600 }}>Direction:</span>
-                  <span style={{ color: '#a29bfe', fontWeight: 700 }}>
-                    {detectionHUD.clockPosition}
-                  </span>
-                </div>
-
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '11px' }}>
-                  <span style={{ color: 'rgba(255,255,255,0.5)', fontWeight: 600 }}>Motion:</span>
-                  <span style={{ 
-                    color: detectionHUD.movement === 'APPROACHING' ? '#ff3b30' : detectionHUD.movement === 'MOVING AWAY' ? '#00f2fe' : 'white', 
-                    fontWeight: 700 
-                  }}>
-                    {detectionHUD.movement}
-                  </span>
-                </div>
-
-                {detectionHUD.handSign && (
-                  <div style={{ 
-                    display: 'flex', 
-                    justifyContent: 'space-between', 
-                    alignItems: 'center', 
-                    fontSize: '11px',
-                    background: 'rgba(0, 242, 254, 0.08)',
-                    padding: '2px 6px',
-                    borderRadius: '8px',
-                    marginTop: '2px',
-                    border: '1px solid rgba(0, 242, 254, 0.15)'
-                  }}>
-                    <span style={{ color: '#00f2fe', fontWeight: 700 }}>Gesture:</span>
-                    <span style={{ color: '#00f2fe', fontWeight: 800 }}>
-                      {detectionHUD.handSign}
-                    </span>
-                  </div>
-                )}
-              </div>
-            </div>
           </div>
 
-          {/* Top HUD Toolbar right container */}
-          <div style={{ display: 'flex', gap: '12px', alignItems: 'center' }}>
-            {/* Compact Telemetry Status Bar */}
-            <div className="glass-panel" style={{ 
-              display: 'flex', 
-              gap: '12px', 
-              padding: '5px 14px', 
-              borderRadius: '20px', 
-              border: '1px solid rgba(255,255,255,0.1)', 
-              background: 'rgba(10, 10, 15, 0.65)', 
-              backdropFilter: 'blur(10px)',
+          {/* Top HUD Toolbar right container: Date, Time, Location & Controls */}
+          <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'nowrap', justifyContent: 'flex-end' }}>
+            
+            {/* 📍 TOP RIGHT CORNER: DATE, TIME & LIVE LOCATION BADGE */}
+            <div className="glass-panel" style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: '12px',
+              padding: '6px 14px',
+              borderRadius: '20px',
+              background: 'rgba(10, 12, 18, 0.75)',
+              border: '1px solid rgba(0, 242, 254, 0.25)',
+              backdropFilter: 'blur(16px)',
+              boxShadow: '0 4px 20px rgba(0,0,0,0.4)',
               whiteSpace: 'nowrap'
             }}>
-              <span style={{ fontSize: '11px', fontWeight: 700, color: '#34c759', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                🔋 87%
-              </span>
-              <span style={{ fontSize: '11px', fontWeight: 700, color: '#00f2fe', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                🌐 Live
-              </span>
-              <span style={{ fontSize: '11px', fontWeight: 700, color: '#a29bfe', display: 'flex', alignItems: 'center', gap: '4px' }}>
-                🎯 96%
-              </span>
+              {/* Live Blinking Dot */}
+              <span style={{
+                width: '8px',
+                height: '8px',
+                borderRadius: '50%',
+                background: '#34c759',
+                boxShadow: '0 0 10px #34c759',
+                animation: 'pulse-gentle 1.5s infinite'
+              }} />
+
+              {/* Time & Date */}
+              <div style={{ display: 'flex', flexDirection: 'column', textAlign: 'left' }}>
+                <div style={{ fontSize: '12px', fontWeight: 800, color: 'white', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                  <span>🕒</span> {timeStr || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                </div>
+                <div style={{ fontSize: '9px', fontWeight: 700, color: '#a29bfe' }}>
+                  {new Date().toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' })}
+                </div>
+              </div>
+
+              <div style={{ width: '1px', height: '22px', background: 'rgba(255,255,255,0.12)' }} />
+
+              {/* Live Location */}
+              <div style={{ display: 'flex', flexDirection: 'column', textAlign: 'left' }}>
+                <div style={{ fontSize: '11px', fontWeight: 800, color: '#00f2fe', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                  <span>📍</span> {gps.city}
+                </div>
+                <div style={{ fontSize: '9px', fontWeight: 600, color: 'rgba(255,255,255,0.5)' }}>
+                  {gps.lat.toFixed(4)}° N, {gps.lon.toFixed(4)}° E
+                </div>
+              </div>
             </div>
 
             {/* Media Upload Control */}
@@ -980,6 +1068,7 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
               style={{ display: 'none' }} 
               id="media-upload-input" 
             />
+
             {/* Camera facing switcher (always visible) */}
             <button 
               onClick={() => {
@@ -1123,41 +1212,169 @@ const CameraAssist: React.FC<CameraAssistProps> = ({ showMenu, setShowMenu, faci
           )}
         </AnimatePresence>
 
-        {/* Dynamic Voice Responses - Low Profile Floating Subtitle Pill */}
-        <AnimatePresence>
-          {subtitles && (
-            <motion.div
-              initial={{ opacity: 0, y: 30 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 10 }}
-              style={{
-                position: 'fixed',
-                bottom: '40px',
-                left: showMenu && !isMobile ? '30%' : '50%',
-                transform: 'translateX(-50%)',
-                zIndex: 10,
-                pointerEvents: 'none',
-                transition: 'left 0.5s cubic-bezier(0.16, 1, 0.3, 1)'
-              }}
-            >
-              <div className="glass-panel" style={{
-                padding: '12px 28px',
-                borderRadius: '30px',
-                background: 'rgba(0,0,0,0.85)',
-                border: '1.2px solid rgba(255,255,255,0.22)',
-                color: '#00f2fe',
-                fontSize: '15px',
-                fontWeight: 600,
-                textAlign: 'center',
-                boxShadow: '0 8px 32px rgba(0,0,0,0.6)',
-                whiteSpace: 'nowrap',
-                letterSpacing: '0.5px'
-              }}>
-                🎙️ {subtitles}
-              </div>
-            </motion.div>
+        {/* 📹 LIVE DETECTED OBJECTS FEED (COMPACT RIGHT ALIGNED) */}
+        <div style={{
+          position: 'fixed',
+          bottom: '80px',
+          right: showMenu && !isMobile ? 'calc(40vw + 24px)' : '24px',
+          width: isMobile ? 'calc(100vw - 48px)' : '340px',
+          maxHeight: '320px',
+          zIndex: 40,
+          pointerEvents: 'none',
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'flex-end',
+          gap: '6px',
+          transition: 'right 0.5s cubic-bezier(0.16, 1, 0.3, 1)'
+        }}>
+          {/* Live Chat Header Badge */}
+          <div style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '8px',
+            background: 'rgba(10, 12, 18, 0.85)',
+            border: '1px solid rgba(255, 59, 48, 0.4)',
+            borderRadius: '20px',
+            padding: '4px 12px',
+            width: 'fit-content',
+            backdropFilter: 'blur(12px)',
+            boxShadow: '0 4px 15px rgba(255, 59, 48, 0.25)'
+          }}>
+            <span style={{
+              width: '8px',
+              height: '8px',
+              borderRadius: '50%',
+              background: '#ff3b30',
+              boxShadow: '0 0 10px #ff3b30',
+              animation: 'pulse-gentle 1.5s infinite'
+            }} />
+            <span style={{ fontSize: '10px', fontWeight: 900, color: 'white', letterSpacing: '1.2px', textTransform: 'uppercase' }}>
+              LIVE CAPTIONS
+            </span>
+            <span style={{ fontSize: '9px', fontWeight: 700, color: '#00f2fe', background: 'rgba(0, 242, 254, 0.12)', padding: '1px 6px', borderRadius: '10px' }}>
+              TOTAL: {totalDetectionsCount}
+            </span>
+          </div>
+
+          {/* Live Object Breakdown Bar (Tightly Right-Aligned directly below header) */}
+          {Object.keys(objectCounts).length > 0 && (
+            <div style={{
+              display: 'flex',
+              flexWrap: 'wrap',
+              justifyContent: 'flex-end',
+              gap: '4px',
+              width: '100%',
+              maxWidth: '340px',
+              pointerEvents: 'auto'
+            }}>
+              {Object.entries(objectCounts).map(([name, count]) => (
+                <span key={name} style={{
+                  fontSize: '9.5px',
+                  fontWeight: 800,
+                  color: 'white',
+                  background: 'rgba(12, 16, 26, 0.9)',
+                  border: '1px solid rgba(0, 242, 254, 0.3)',
+                  padding: '2px 8px',
+                  borderRadius: '12px',
+                  whiteSpace: 'nowrap',
+                  backdropFilter: 'blur(8px)',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: '4px'
+                }}>
+                  <span>{getObjectIcon(name)}</span>
+                  <span style={{ color: 'rgba(255,255,255,0.7)', textTransform: 'uppercase' }}>{name}:</span>
+                  <strong style={{ color: '#00f2fe' }}>{count}</strong>
+                </span>
+              ))}
+            </div>
           )}
-        </AnimatePresence>
+
+          {/* Live Comments Stream */}
+          <div style={{
+            display: 'flex',
+            flexDirection: 'column-reverse',
+            gap: '6px',
+            width: '100%',
+            maxWidth: '340px',
+            overflowY: 'hidden',
+            maxHeight: '220px'
+          }}>
+            <AnimatePresence initial={false}>
+              {liveCaptions.map((item) => (
+                <motion.div
+                  key={item.id}
+                  initial={{ opacity: 0, x: -30, scale: 0.95 }}
+                  animate={{ opacity: 1, x: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 10 }}
+                  transition={{ type: 'spring', damping: 20, stiffness: 300 }}
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    background: 'linear-gradient(135deg, rgba(12, 16, 26, 0.85) 0%, rgba(8, 10, 16, 0.75) 100%)',
+                    border: '1px solid rgba(0, 242, 254, 0.2)',
+                    borderRadius: '12px',
+                    padding: '8px 12px',
+                    backdropFilter: 'blur(16px)',
+                    boxShadow: '0 4px 16px rgba(0,0,0,0.4)',
+                    pointerEvents: 'auto'
+                  }}
+                >
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px', textAlign: 'left' }}>
+                    {/* Object Icon Avatar */}
+                    <div style={{
+                      width: '28px',
+                      height: '28px',
+                      borderRadius: '50%',
+                      background: 'rgba(0, 242, 254, 0.12)',
+                      border: '1px solid rgba(0, 242, 254, 0.3)',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      fontSize: '14px',
+                      flexShrink: 0
+                    }}>
+                      {item.icon}
+                    </div>
+
+                    <div style={{ display: 'flex', flexDirection: 'column' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                        <span style={{ fontSize: '12px', fontWeight: 800, color: '#00f2fe', letterSpacing: '0.5px' }}>
+                          {item.objectName}
+                        </span>
+                        <span style={{ fontSize: '11px', fontWeight: 600, color: '#a29bfe' }}>
+                          {item.direction}
+                        </span>
+                      </div>
+                      <span style={{ fontSize: '9px', color: 'rgba(255,255,255,0.4)', fontWeight: 600 }}>
+                        {item.time} • Live Stream
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Distance Badge */}
+                  <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: '2px' }}>
+                    <span style={{
+                      fontSize: '11px',
+                      fontWeight: 800,
+                      color: '#34c759',
+                      background: 'rgba(52, 199, 89, 0.12)',
+                      border: '1px solid rgba(52, 199, 89, 0.3)',
+                      padding: '1px 7px',
+                      borderRadius: '10px'
+                    }}>
+                      {item.distance}
+                    </span>
+                    <span style={{ fontSize: '8px', color: 'rgba(255,255,255,0.4)', fontWeight: 700 }}>
+                      {item.confidence}% match
+                    </span>
+                  </div>
+                </motion.div>
+              ))}
+            </AnimatePresence>
+          </div>
+        </div>
 
         {/* Border-Aligned Telemetry and Target Lock Panel Bar */}
         <div style={{ 
